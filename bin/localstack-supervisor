@@ -9,6 +9,7 @@ The supervisor behaves as follows:
 
 The methods ``waitpid_reap_other_children`` and ``stop_child_process`` were adapted from baseimage-docker
 licensed under MIT: https://github.com/phusion/baseimage-docker/blob/rel-0.9.16/image/bin/my_init"""
+
 import errno
 import os
 import signal
@@ -17,16 +18,29 @@ import sys
 import threading
 from typing import Optional
 
-LOCALSTACK_COMMAND = [sys.executable, "-m", "localstack.runtime.main"]
-"""This command is used to run the localstack process"""
-
 DEBUG = os.getenv("DEBUG", "").strip().lower() in ["1", "true"]
+
+# configurable process shutdown timeout, to allow for longer shutdown procedures
+DEFAULT_SHUTDOWN_TIMEOUT = int(os.getenv("SHUTDOWN_TIMEOUT", "").strip() or 5)
 
 
 class AlarmException(Exception):
     """Special exception raise if SIGALRM is received."""
 
     pass
+
+
+def get_localstack_command() -> list[str]:
+    """
+    Allow modification of the command to start LocalStack
+    :return: Command to start LocalStack
+    """
+    import shlex
+
+    command = os.environ.get("LOCALSTACK_SUPERVISOR_COMMAND")
+    if not command:
+        return [sys.executable, "-m", "localstack.runtime.main"]
+    return shlex.split(command)
 
 
 def log(message: str):
@@ -77,7 +91,7 @@ def waitpid_reap_other_children(pid: int) -> Optional[int]:
     return status
 
 
-def stop_child_process(name: str, pid: int, sig: int = signal.SIGTERM, timeout: int = 5):
+def stop_child_process(name: str, pid: int, sig: int = signal.SIGTERM, timeout: int | None = None):
     """
     Sends a signal to the given process and then waits for all child processes to avoid zombie processes.
 
@@ -92,6 +106,7 @@ def stop_child_process(name: str, pid: int, sig: int = signal.SIGTERM, timeout: 
         os.kill(pid, sig)
     except OSError:
         pass
+    timeout = timeout or DEFAULT_SHUTDOWN_TIMEOUT
     signal.alarm(timeout)
     try:
         waitpid_reap_other_children(pid)
@@ -155,7 +170,7 @@ def main():
 
             # start a new localstack process
             process = subprocess.Popen(
-                LOCALSTACK_COMMAND,
+                get_localstack_command(),
                 stdout=sys.stdout,
                 stderr=subprocess.STDOUT,
             )

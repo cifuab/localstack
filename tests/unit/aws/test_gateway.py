@@ -20,6 +20,7 @@ def serve_gateway_hypercorn():
 
     def _create(gateway: Gateway) -> HypercornServer:
         config = Config()
+        config.h11_pass_raw_headers = True
         config.bind = f"localhost:{net.get_free_tcp_port()}"
         loop = asyncio.new_event_loop()
         srv = HypercornServer(AsgiGateway(gateway, event_loop=loop), config, loop=loop)
@@ -32,9 +33,9 @@ def serve_gateway_hypercorn():
 
     for server in _servers:
         server.shutdown()
-        assert poll_condition(
-            lambda: not server.is_up(), timeout=10
-        ), "gave up waiting for server to shut down"
+        assert poll_condition(lambda: not server.is_up(), timeout=10), (
+            "gave up waiting for server to shut down"
+        )
 
 
 def test_gateway_served_through_hypercorn_preserves_client_headers(serve_gateway_hypercorn):

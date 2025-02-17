@@ -1,11 +1,13 @@
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from threading import Thread
 from typing import List
 
+import pytest
 import requests
 from werkzeug import Request, Response
 
@@ -96,6 +98,43 @@ def test_chunked_transfer_encoding_response(serve_asgi_adapter):
     assert next(it) == b"baz"
 
 
+def test_chunked_transfer_encoding_client_timeout(serve_asgi_adapter):
+    # this test makes sure that creating a response with a generator automatically creates a
+    # transfer-encoding=chunked response
+
+    generator_exited = threading.Event()
+    continue_request = threading.Event()
+
+    @Request.application
+    def app(_request: Request) -> Response:
+        def _gen():
+            try:
+                yield "foo"
+                yield "bar\n"
+                continue_request.wait()
+                # only three are needed, let's send some more to make sure
+                for _ in range(10):
+                    yield "baz\n"
+            except GeneratorExit:
+                generator_exited.set()
+
+        return Response(_gen(), 200)
+
+    server = serve_asgi_adapter(app)
+
+    with requests.get(server.url, stream=True) as response:
+        assert response.headers["Transfer-Encoding"] == "chunked"
+
+        it = response.iter_lines()
+
+        assert next(it) == b"foobar"
+
+    # request is now closed, continue the response generator
+    continue_request.set()
+    # this flag is only set when generator is exited
+    assert generator_exited.wait(timeout=10)
+
+
 def test_chunked_transfer_encoding_request(serve_asgi_adapter):
     request_list: List[Request] = []
 
@@ -128,6 +167,41 @@ def test_chunked_transfer_encoding_request(serve_asgi_adapter):
     assert response.text == "foobar\nbaz"
 
     assert request_list[0].headers["Transfer-Encoding"].lower() == "chunked"
+
+
+def test_close_iterable_response(serve_asgi_adapter):
+    class IterableResponse:
+        def __init__(self, data: list[bytes]):
+            self.data = data
+            self.closed = False
+
+        def __iter__(self):
+            for packet in self.data:
+                yield packet
+
+        def close(self):
+            # should be called through the werkzeug layers
+            self.closed = True
+
+    iterable = IterableResponse([b"foo", b"bar"])
+
+    @Request.application
+    def app(request: Request) -> Response:
+        return Response(iterable, 200)
+
+    server = serve_asgi_adapter(app)
+
+    response = requests.get(server.url, stream=True)
+
+    gen = response.iter_content(chunk_size=3)
+    assert next(gen) == b"foo"
+    assert next(gen) == b"bar"
+    assert not iterable.closed
+
+    with pytest.raises(StopIteration):
+        next(gen)
+
+    assert iterable.closed
 
 
 def test_input_stream_methods(serve_asgi_adapter):
@@ -298,7 +372,6 @@ def test_serve_multiple_apps(serve_asgi_adapter):
 
 
 def test_lifespan_listener(serve_asgi_adapter):
-
     events = Queue()
 
     @Request.application

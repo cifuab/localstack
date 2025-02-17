@@ -5,10 +5,17 @@ import pytest
 import requests
 import werkzeug
 from werkzeug.exceptions import MethodNotAllowed, NotFound
-from werkzeug.routing import RequestRedirect
+from werkzeug.routing import RequestRedirect, Submount
 
 from localstack.http import Request, Response, Router
-from localstack.http.router import E, RequestArguments, route
+from localstack.http.router import (
+    E,
+    GreedyPathConverter,
+    RequestArguments,
+    RuleAdapter,
+    WithHost,
+    route,
+)
 from localstack.utils.common import get_free_tcp_port
 
 
@@ -193,6 +200,8 @@ class TestRouter:
         assert router.dispatch(Request(path="/my//path")).json == {"path": "my//path"}
         assert router.dispatch(Request(path="/my//path/")).json == {"path": "my//path/"}
         assert router.dispatch(Request(path="/my/path foobar")).json == {"path": "my/path foobar"}
+        assert router.dispatch(Request(path="//foobar")).json == {"path": "foobar"}
+        assert router.dispatch(Request(path="//foobar/")).json == {"path": "foobar/"}
 
     def test_path_converter_with_args(self):
         router = Router()
@@ -286,6 +295,56 @@ class TestRouter:
             "port": None,
         }
 
+    def test_greedy_path_converter(self):
+        router = Router(converters={"greedy_path": GreedyPathConverter})
+        router.add(path="/<greedy_path:path>", endpoint=echo_params_json)
+
+        assert router.dispatch(Request(path="/my")).json == {"path": "my"}
+        assert router.dispatch(Request(path="/my/")).json == {"path": "my/"}
+        assert router.dispatch(Request(path="/my//path")).json == {"path": "my//path"}
+        assert router.dispatch(Request(path="/my//path/")).json == {"path": "my//path/"}
+        assert router.dispatch(Request(path="/my/path foobar")).json == {"path": "my/path foobar"}
+        assert router.dispatch(Request(path="//foobar")).json == {"path": "foobar"}
+        assert router.dispatch(Request(path="//foobar/")).json == {"path": "foobar/"}
+
+    def test_greedy_path_converter_with_args(self):
+        router = Router(converters={"greedy_path": GreedyPathConverter})
+        router.add(path="/with-args/<some_id>/<greedy_path:path>", endpoint=echo_params_json)
+
+        assert router.dispatch(Request(path="/with-args/123456/my")).json == {
+            "some_id": "123456",
+            "path": "my",
+        }
+
+        # werkzeug no longer removes trailing slashes in matches
+        assert router.dispatch(Request(path="/with-args/123456/my/")).json == {
+            "some_id": "123456",
+            "path": "my/",
+        }
+
+        # works with sub paths
+        assert router.dispatch(Request(path="/with-args/123456/my/path")).json == {
+            "some_id": "123456",
+            "path": "my/path",
+        }
+
+        # no sub path with no trailing slash raises 404
+        with pytest.raises(NotFound):
+            router.dispatch(Request(path="/with-args/123456"))
+
+        # greedy path accepts empty sub path if there's a trailing slash
+        assert router.dispatch(Request(path="/with-args/123456/")).json == {
+            "some_id": "123456",
+            "path": "",
+        }
+
+        # with the GreedyPath converter, we no longer redirect and accept the request
+        # in order the retrieve the double slash between parameter, we might need to use the RAW_URI
+        assert router.dispatch(Request(path="/with-args/123456//my/test//")).json == {
+            "some_id": "123456",
+            "path": "/my/test//",
+        }
+
     def test_remove_rule(self):
         router = Router()
 
@@ -301,13 +360,13 @@ class TestRouter:
         assert router.dispatch(Request("GET", "/")).data == b"index"
         assert router.dispatch(Request("GET", "/users/12")).data == b"users"
 
-        router.remove_rule(rule1)
+        router.remove(rule1)
 
         assert router.dispatch(Request("GET", "/")).data == b"index"
         with pytest.raises(NotFound):
             assert router.dispatch(Request("GET", "/users/12"))
 
-        router.remove_rule(rule0)
+        router.remove(rule0)
         with pytest.raises(NotFound):
             assert router.dispatch(Request("GET", "/"))
         with pytest.raises(NotFound):
@@ -350,10 +409,10 @@ class TestRouter:
             return Response(b"index")
 
         rule = router.add("/", index)
-        router.remove_rule(rule)
+        router.remove(rule)
 
         with pytest.raises(KeyError) as e:
-            router.remove_rule(rule)
+            router.remove(rule)
         e.match("no such rule")
 
     def test_router_route_decorator(self):
@@ -442,6 +501,66 @@ class TestRouter:
 
         assert router.dispatch(Request("GET", "/my_api")).data == b"/my_api/do-get"
         assert router.dispatch(Request("HEAD", "/my_api")).data == b"/my_api/do-get"
+
+    def test_submount_rule_adapter(self):
+        @route("/my_api", methods=["GET"])
+        def do_get(request: Request, _args):
+            # should be inherited
+            return Response(f"{request.path}/do-get")
+
+        def hello(request: Request, _args):
+            return Response("hello world")
+
+        router = Router()
+
+        # base endpoints
+        endpoints = RuleAdapter([do_get, RuleAdapter("/hello", hello)])
+
+        router.add([endpoints, Submount("/foo", [endpoints])])
+
+        assert router.dispatch(Request("GET", "/foo/my_api")).data == b"/foo/my_api/do-get"
+        assert router.dispatch(Request("GET", "/my_api")).data == b"/my_api/do-get"
+
+        assert router.dispatch(Request("GET", "/foo/hello")).data == b"hello world"
+        assert router.dispatch(Request("GET", "/hello")).data == b"hello world"
+
+    def test_with_host_and_submount(self):
+        @route("/my_api", methods=["GET"])
+        def do_get(request: Request, _args):
+            response = Response()
+            response.set_json({"path": request.path, "host": request.host})
+            return response
+
+        router = Router()
+
+        router.add(
+            [
+                WithHost(
+                    "foo.localhost.localstack.cloud:4566",
+                    [RuleAdapter(do_get)],
+                ),
+                Submount(
+                    "/foo",
+                    [RuleAdapter(do_get)],
+                ),
+            ]
+        )
+
+        request = Request("GET", "/foo/my_api")
+        assert router.dispatch(request).json == {
+            "host": "127.0.0.1",
+            "path": "/foo/my_api",
+        }
+
+        request = Request("GET", "/my_api", server=("foo.localhost.localstack.cloud", 4566))
+        assert router.dispatch(request).json == {
+            "path": "/my_api",
+            "host": "foo.localhost.localstack.cloud:4566",
+        }
+
+        request = Request("GET", "/my_api", server=("localhost.localstack.cloud", 4566))
+        with pytest.raises(NotFound):
+            router.dispatch(request)
 
 
 class TestWsgiIntegration:
