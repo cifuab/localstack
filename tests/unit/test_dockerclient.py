@@ -1,5 +1,6 @@
 import json
 import logging
+import textwrap
 from typing import List
 from unittest.mock import patch
 
@@ -29,7 +30,7 @@ class TestDockerClient:
         mock_container = {
             "ID": "00000000a1",
             "Image": "localstack/localstack",
-            "Names": "localstack_main",
+            "Names": "localstack-main",
             "Labels": "authors=LocalStack Contributors",
             "State": "running",
         }
@@ -37,7 +38,7 @@ class TestDockerClient:
             "id": mock_container["ID"],
             "image": mock_container["Image"],
             "name": mock_container["Names"],
-            "labels": mock_container["Labels"],
+            "labels": {"authors": "LocalStack Contributors"},
             "status": mock_container["State"],
         }
         run_mock.return_value = json.dumps(mock_container)
@@ -52,16 +53,16 @@ class TestDockerClient:
 
     @patch("localstack.utils.container_utils.docker_cmd_client.run")
     def test_container_status(self, run_mock):
-        test_output = "Up 2 minutes - localstack_main"
+        test_output = "Up 2 minutes - localstack-main"
         run_mock.return_value = test_output
         docker_client = CmdDockerClient()
-        status = docker_client.get_container_status("localstack_main")
+        status = docker_client.get_container_status("localstack-main")
         assert status == DockerContainerStatus.UP
-        run_mock.return_value = "Exited (0) 1 minute ago - localstack_main"
-        status = docker_client.get_container_status("localstack_main")
+        run_mock.return_value = "Exited (0) 1 minute ago - localstack-main"
+        status = docker_client.get_container_status("localstack-main")
         assert status == DockerContainerStatus.DOWN
         run_mock.return_value = "STATUS    NAME"
-        status = docker_client.get_container_status("localstack_main")
+        status = docker_client.get_container_status("localstack-main")
         assert status == DockerContainerStatus.NON_EXISTENT
 
 
@@ -77,6 +78,7 @@ class TestArgumentParsing:
         test_port_string_many_to_one = "-p 9230-9231:9230"
         test_ulimit_string = "--ulimit nofile=768:1024 --ulimit nproc=3"
         test_user_string = "-u sbx_user1051"
+        test_dns_string = "--dns 1.2.3.4 --dns 5.6.7.8"
         argument_string = " ".join(
             [
                 test_env_string,
@@ -89,6 +91,7 @@ class TestArgumentParsing:
                 test_privileged_string,
                 test_ulimit_string,
                 test_user_string,
+                test_dns_string,
             ]
         )
         env_vars = {}
@@ -102,7 +105,7 @@ class TestArgumentParsing:
         flags = Util.parse_additional_flags(
             argument_string,
             env_vars=env_vars,
-            mounts=mounts,
+            volumes=mounts,
             network=network,
             platform=platform,
             privileged=privileged,
@@ -121,12 +124,13 @@ class TestArgumentParsing:
             Ulimit(name="nofile", soft_limit=768, hard_limit=1024),
         ]
         assert flags.user == "sbx_user1051"
+        assert flags.dns == ["1.2.3.4", "5.6.7.8"]
 
         argument_string = (
             "--add-host host.docker.internal:host-gateway --add-host arbitrary.host:127.0.0.1"
         )
         flags = Util.parse_additional_flags(
-            argument_string, env_vars=env_vars, ports=ports, mounts=mounts
+            argument_string, env_vars=env_vars, ports=ports, volumes=mounts
         )
         assert {
             "host.docker.internal": "host-gateway",
@@ -147,10 +151,10 @@ class TestArgumentParsing:
     def test_file_paths(self):
         argument_string = r'-v "/tmp/test.jar:/tmp/foo bar/test.jar"'
         flags = Util.parse_additional_flags(argument_string)
-        assert flags.mounts == [(r"/tmp/test.jar", "/tmp/foo bar/test.jar")]
+        assert flags.volumes == [(r"/tmp/test.jar", "/tmp/foo bar/test.jar")]
         argument_string = r'-v "/tmp/test-foo_bar.jar:/tmp/test-foo_bar2.jar"'
         flags = Util.parse_additional_flags(argument_string)
-        assert flags.mounts == [(r"/tmp/test-foo_bar.jar", "/tmp/test-foo_bar2.jar")]
+        assert flags.volumes == [(r"/tmp/test-foo_bar.jar", "/tmp/test-foo_bar2.jar")]
 
     def test_labels(self):
         argument_string = r"--label foo=bar.123"
@@ -186,6 +190,9 @@ class TestArgumentParsing:
         argument_string = r"--privileged"
         flags = Util.parse_additional_flags(argument_string)
         assert flags.privileged
+        argument_string = ""
+        flags = Util.parse_additional_flags(argument_string)
+        assert not flags.privileged
 
     def test_ulimits(self):
         argument_string = r"--ulimit nofile=1024"
@@ -197,25 +204,110 @@ class TestArgumentParsing:
         flags = Util.parse_additional_flags(argument_string)
         assert flags.user == "nobody"
 
+    def test_dns(self):
+        argument_string = "--dns 1.2.3.4"
+        flags = Util.parse_additional_flags(argument_string)
+        assert flags.dns == ["1.2.3.4"]
+
+        argument_string = "--dns 1.2.3.4 --dns 5.6.7.8"
+        flags = Util.parse_additional_flags(argument_string)
+        assert flags.dns == ["1.2.3.4", "5.6.7.8"]
+
+        argument_string = ""
+        flags = Util.parse_additional_flags(argument_string)
+        assert flags.dns == []
+
     def test_windows_paths(self):
         argument_string = r'-v "C:\Users\SomeUser\SomePath:/var/task"'
         flags = Util.parse_additional_flags(argument_string)
-        assert flags.mounts == [(r"C:\Users\SomeUser\SomePath", "/var/task")]
+        assert flags.volumes == [(r"C:\Users\SomeUser\SomePath", "/var/task")]
         argument_string = r'-v "C:\Users\SomeUser\SomePath:/var/task:ro"'
         flags = Util.parse_additional_flags(argument_string)
-        assert flags.mounts == [(r"C:\Users\SomeUser\SomePath", "/var/task")]
+        assert flags.volumes == [(r"C:\Users\SomeUser\SomePath", "/var/task")]
         argument_string = r'-v "C:\Users\Some User\Some Path:/var/task:ro"'
         flags = Util.parse_additional_flags(argument_string)
-        assert flags.mounts == [(r"C:\Users\Some User\Some Path", "/var/task")]
+        assert flags.volumes == [(r"C:\Users\Some User\Some Path", "/var/task")]
         argument_string = r'-v "/var/test:/var/task:ro"'
         flags = Util.parse_additional_flags(argument_string)
-        assert flags.mounts == [("/var/test", "/var/task")]
+        assert flags.volumes == [("/var/test", "/var/task")]
+
+    def test_random_ports(self):
+        argument_string = r"-p 0:80"
+        ports = PortMappings()
+        Util.parse_additional_flags(argument_string, ports=ports)
+        assert ports.to_str() == "-p 0:80"
+        assert ports.to_dict() == {"80/tcp": None}
+
+    def test_env_files(self, tmp_path):
+        env_file_1 = tmp_path / "env1"
+        env_file_2 = tmp_path / "env2"
+        env_vars_1 = textwrap.dedent("""
+            # Some comment
+            TEST1=VAL1
+            TEST2=VAL2
+            TEST3=${TEST2}
+            """)
+        env_vars_2 = textwrap.dedent("""
+            # Some comment
+            TEST3=VAL3_OVERRIDE
+            """)
+        env_file_1.write_text(env_vars_1)
+        env_file_2.write_text(env_vars_2)
+
+        argument_string = f"--env-file {env_file_1}"
+        flags = Util.parse_additional_flags(argument_string)
+        assert flags.env_vars == {
+            "TEST1": "VAL1",
+            "TEST2": "VAL2",
+            "TEST3": "${TEST2}",
+        }
+
+        argument_string = f"-e TEST2=VAL2_OVERRIDE --env-file {env_file_1} --env-file {env_file_2}"
+        flags = Util.parse_additional_flags(argument_string)
+        assert flags.env_vars == {
+            "TEST1": "VAL1",
+            "TEST2": "VAL2_OVERRIDE",
+            "TEST3": "VAL3_OVERRIDE",
+        }
+
+    def test_compose_env_files(self, tmp_path):
+        env_file_1 = tmp_path / "env1"
+        env_file_2 = tmp_path / "env2"
+        env_vars_1 = textwrap.dedent("""
+            # Some comment
+            TEST1=VAL1
+            TEST2=VAL2
+            TEST3=${TEST2}
+            TEST4="VAL4"
+            """)
+        env_vars_2 = textwrap.dedent("""
+            # Some comment
+            TEST3=VAL3_OVERRIDE
+            """)
+        env_file_1.write_text(env_vars_1)
+        env_file_2.write_text(env_vars_2)
+
+        argument_string = f"--compose-env-file {env_file_1}"
+        flags = Util.parse_additional_flags(argument_string)
+        assert flags.env_vars == {
+            "TEST1": "VAL1",
+            "TEST2": "VAL2",
+            "TEST3": "VAL2",
+            "TEST4": "VAL4",
+        }
+
+        argument_string = f"-e TEST2=VAL2_OVERRIDE --compose-env-file {env_file_1} --compose-env-file {env_file_2}"
+        flags = Util.parse_additional_flags(argument_string)
+        assert flags.env_vars == {
+            "TEST1": "VAL1",
+            "TEST2": "VAL2_OVERRIDE",
+            "TEST3": "VAL3_OVERRIDE",
+            "TEST4": "VAL4",
+        }
 
 
 def list_in(a, b):
-    return len(a) <= len(b) and any(
-        map(lambda x: b[x : x + len(a)] == a, range(len(b) - len(a) + 1))
-    )
+    return len(a) <= len(b) and any((b[x : x + len(a)] == a for x in range(len(b) - len(a) + 1)))
 
 
 class TestPortMappings:
