@@ -9,7 +9,7 @@ from werkzeug.datastructures import Headers
 from werkzeug.wrappers import Request as WerkzeugRequest
 
 from localstack.http import Response
-from localstack.http.asgi import ASGIAdapter, ASGILifespanListener
+from localstack.http.asgi import ASGIAdapter, ASGILifespanListener, WebSocketListener
 from localstack.http.hypercorn import HypercornServer
 from localstack.utils import net
 from localstack.utils.sync import poll_condition
@@ -26,6 +26,7 @@ def serve_asgi_app():
     ) -> HypercornServer:
         if not config:
             config = Config()
+            config.h11_pass_raw_headers = True
             config.bind = f"localhost:{net.get_free_tcp_port()}"
 
         srv = HypercornServer(app, config, loop=event_loop)
@@ -38,20 +39,25 @@ def serve_asgi_app():
 
     for server in _servers:
         server.shutdown()
-        assert poll_condition(
-            lambda: not server.is_up(), timeout=10
-        ), "gave up waiting for server to shut down"
+        assert poll_condition(lambda: not server.is_up(), timeout=10), (
+            "gave up waiting for server to shut down"
+        )
 
 
 @pytest.fixture()
 def serve_asgi_adapter(serve_asgi_app):
-    def _create(wsgi_app, lifespan_listener: ASGILifespanListener = None):
+    def _create(
+        wsgi_app,
+        lifespan_listener: ASGILifespanListener = None,
+        websocket_listener: WebSocketListener = None,
+    ):
         loop = asyncio.new_event_loop()
         return serve_asgi_app(
             ASGIAdapter(
                 wsgi_app,
                 event_loop=loop,
                 lifespan_listener=lifespan_listener,
+                websocket_listener=websocket_listener,
             ),
             event_loop=loop,
         )

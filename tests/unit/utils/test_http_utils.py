@@ -1,3 +1,5 @@
+import os
+import re
 import time
 
 import pytest
@@ -10,7 +12,7 @@ from localstack.utils.http import ACCEPT, add_query_params_to_url, canonicalize_
 
 def test_canonicalize_headers():
     headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9," "*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-encoding": "gzip, deflate, br",
         "Accept-language": "en-GB,en;q=0.9",
         "Host": "c2m48evwfk.execute-api.eu-west-1.amazonaws.com",
@@ -41,17 +43,17 @@ def test_add_query_params_to_url():
         {
             "uri": "http://localhost.localstack.cloud?foo=bar",
             "query_params": {"param": "122323"},
-            "expected": "http://localhost.localstack.cloud?foo=bar&param" "=122323",
+            "expected": "http://localhost.localstack.cloud?foo=bar&param=122323",
         },
         {
             "uri": "http://localhost.localstack.cloud/foo/bar",
             "query_params": {"param": "122323"},
-            "expected": "http://localhost.localstack.cloud/foo/bar?param" "=122323",
+            "expected": "http://localhost.localstack.cloud/foo/bar?param=122323",
         },
         {
             "uri": "http://localhost.localstack.cloud/foo/bar?foo=bar",
             "query_params": {"param": "122323"},
-            "expected": "http://localhost.localstack.cloud/foo/bar?foo=bar" "&param=122323",
+            "expected": "http://localhost.localstack.cloud/foo/bar?foo=bar&param=122323",
         },
         {
             "uri": "http://localhost.localstack.cloud?foo=bar",
@@ -63,6 +65,54 @@ def test_add_query_params_to_url():
     for t in tt:
         result = add_query_params_to_url(t["uri"], t["query_params"])
         assert result == t["expected"]
+
+
+@pytest.mark.parametrize("total_size_known", [False, True])
+def test_download_progress(httpserver, caplog, total_size_known):
+    content = bytes(
+        list(os.urandom(1024 * 246) * 40)
+    )  # 0.25 MB of random bytes, 40 times -> 10 MB, nicely compressable
+
+    def _handler(_: Request) -> Response:
+        import gzip
+
+        compressed_content = gzip.compress(content)
+        headers = {"Content-Encoding": "gzip"}
+        if total_size_known:
+            headers["Content-Length"] = len(compressed_content)
+            body = compressed_content
+        else:
+
+            def _generator():
+                yield compressed_content
+
+            # use a generator to avoid werkzeug determining / setting the content length
+            body = _generator()
+        return Response(body, status=200, headers=headers)
+
+    httpserver.expect_request("/").respond_with_handler(_handler)
+    http_endpoint = httpserver.url_for("/")
+    tmp_file = new_tmp_file()
+
+    # wait 200 ms to make sure the server is ready
+    time.sleep(0.1)
+
+    download(http_endpoint, tmp_file)
+
+    with open(tmp_file, mode="rb") as opened_tmp_file:
+        downloaded_content = opened_tmp_file.read()
+        # assert the downloaded content is equal to the one sent by the server
+        assert content == downloaded_content
+
+    # clean up
+    rm_rf(tmp_file)
+
+    if total_size_known:
+        # check for percentage logs in case the total size is set by the server
+        assert re.search(r"Downloaded \d+% \(total \d+K of \d+K\) to ", caplog.text)
+
+    # check that the final message has been logged
+    assert "Done downloading " in caplog.text
 
 
 def test_download_with_timeout():
